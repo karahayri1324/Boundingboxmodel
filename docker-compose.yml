@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  reap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reap-vlm:latest
+    container_name: reap-vlm
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024
+      - TOKENIZERS_PARALLELISM=false
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./models:/workspace/models
+      - ./output:/workspace/output
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
