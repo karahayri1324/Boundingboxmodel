@@ -9,7 +9,7 @@ echo "Qwen3-VL-235B-A22B-Thinking-AWQ Model Downloader"
 echo "============================================================"
 
 # Configuration
-MODEL_ID="Quyen/Qwen3-VL-235B-A22B-Thinking-AWQ"
+MODEL_ID="tclf90/Qwen3-VL-235B-A22B-Thinking-AWQ"
 MODEL_DIR="./models/Qwen3-VL-235B-A22B-Thinking-AWQ"
 
 # Check if huggingface-cli is installed

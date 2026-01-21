@@ -81,7 +81,7 @@ if [ ! -f "${MODEL_PATH}/config.json" ]; then
 
     huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 
-    huggingface-cli download "Quyen/Qwen3-VL-235B-A22B-Thinking-AWQ" \
+    huggingface-cli download "tclf90/Qwen3-VL-235B-A22B-Thinking-AWQ" \
         --local-dir "$MODEL_PATH" \
         --local-dir-use-symlinks False \
         --resume-download
@@ -102,6 +102,15 @@ if [ ! -f "${CALIB_PATH}/calibration_data.json" ]; then
 fi
 SAMPLE_COUNT=$(python -c "import json; print(len(json.load(open('${CALIB_PATH}/calibration_data.json'))))")
 echo "Kalibrasyon: $SAMPLE_COUNT görsel"
+echo ""
+
+# Model yapısı testi
+echo "[4.5/5] Model Yapısı Kontrolü..."
+python "${SCRIPT_DIR}/test_model_structure.py" "$MODEL_PATH"
+if [ $? -ne 0 ]; then
+    echo "HATA: Model yapısı testi başarısız!"
+    exit 1
+fi
 echo ""
 
 # REAP çalıştır

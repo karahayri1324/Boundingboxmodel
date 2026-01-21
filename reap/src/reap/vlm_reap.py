@@ -60,8 +60,20 @@ VLM_MODEL_ATTRS = {
         "router": "gate",
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
-        # VLM-specific: path to language model layers
-        "layers_path": "model.language_model.layers",
+        "layers_path": "model.layers",  # Qwen3-VL structure
+    },
+    # Fallback for different naming
+    "Qwen2VLForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+        "layers_path": "model.layers",
     },
 }
 
@@ -607,56 +619,88 @@ def main():
     load_kwargs = {
         "trust_remote_code": True,
         "torch_dtype": torch.float16,
-        "attn_implementation": "sdpa",  # Use SDPA instead of flash attention
         "low_cpu_mem_usage": True,
     }
 
-    # For AWQ models, we need to keep everything on GPU
-    # If model doesn't fit, we'll need to use a different approach
+    # Check if this is an AWQ model
+    config_path = pathlib.Path(args.model_path) / "config.json"
+    is_awq = False
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+            is_awq = "quantization_config" in config and config.get("quantization_config", {}).get("quant_method") == "awq"
+
+    if is_awq:
+        logger.info("Detected AWQ quantized model")
+
+    # Try multiple loading strategies
+    model = None
+    errors = []
+
+    # Strategy 1: AutoModelForVision2Seq (best for VLM)
     try:
-        # First try: GPU only (required for AWQ)
-        logger.info("Attempting to load model on GPU only (required for AWQ)...")
-        model = AutoModel.from_pretrained(
+        logger.info("Attempting AutoModelForVision2Seq...")
+        model = AutoModelForVision2Seq.from_pretrained(
             args.model_path,
-            device_map="cuda:0",
+            device_map="auto",
             **load_kwargs,
         )
-        logger.info("Loaded model with AutoModel on GPU")
+        logger.info("Loaded with AutoModelForVision2Seq")
     except Exception as e:
-        logger.warning(f"GPU-only loading failed: {e}")
+        errors.append(f"AutoModelForVision2Seq: {e}")
+        logger.warning(f"AutoModelForVision2Seq failed: {e}")
 
-        # Second try: Use sequential loading with manual device management
+    # Strategy 2: AutoModel with auto device_map
+    if model is None:
         try:
-            logger.info("Attempting sequential layer loading...")
+            logger.info("Attempting AutoModel with auto device_map...")
+            model = AutoModel.from_pretrained(
+                args.model_path,
+                device_map="auto",
+                **load_kwargs,
+            )
+            logger.info("Loaded with AutoModel")
+        except Exception as e:
+            errors.append(f"AutoModel: {e}")
+            logger.warning(f"AutoModel failed: {e}")
+
+    # Strategy 3: Direct class import for Qwen3-VL
+    if model is None:
+        try:
+            logger.info("Attempting direct Qwen3VL import...")
+            from transformers import Qwen2VLForConditionalGeneration
+            model = Qwen2VLForConditionalGeneration.from_pretrained(
+                args.model_path,
+                device_map="auto",
+                **load_kwargs,
+            )
+            logger.info("Loaded with Qwen2VLForConditionalGeneration")
+        except Exception as e:
+            errors.append(f"Qwen2VL: {e}")
+            logger.warning(f"Qwen2VL failed: {e}")
+
+    # Strategy 4: Sequential for large models
+    if model is None:
+        try:
+            logger.info("Attempting sequential device_map...")
             model = AutoModel.from_pretrained(
                 args.model_path,
                 device_map="sequential",
-                max_memory={0: "90GiB"},  # Leave some headroom
+                max_memory={0: f"{int(gpu_mem * 0.95)}GiB"},
                 **load_kwargs,
             )
-            logger.info("Loaded model with sequential device map")
-        except Exception as e2:
-            logger.warning(f"Sequential loading failed: {e2}")
+            logger.info("Loaded with sequential device_map")
+        except Exception as e:
+            errors.append(f"Sequential: {e}")
+            logger.warning(f"Sequential failed: {e}")
 
-            # Third try: Load without quantization config for inspection
-            try:
-                logger.info("Attempting to load without device_map restrictions...")
-                # Try using AutoModelForVision2Seq
-                from transformers import AutoModelForImageTextToText
-                model = AutoModelForImageTextToText.from_pretrained(
-                    args.model_path,
-                    device_map="cuda:0",
-                    **load_kwargs,
-                )
-                logger.info("Loaded model with AutoModelForImageTextToText")
-            except Exception as e3:
-                logger.error(f"All loading methods failed: {e3}")
-                raise RuntimeError(
-                    f"Could not load model from {args.model_path}. "
-                    f"AWQ models require full GPU memory. Your GPU has {gpu_mem:.1f}GB "
-                    f"but model may need more. Consider using a smaller model or "
-                    f"a non-AWQ version with CPU offloading support."
-                )
+    if model is None:
+        error_msg = "\n".join(errors)
+        raise RuntimeError(
+            f"Could not load model from {args.model_path}.\n"
+            f"GPU memory: {gpu_mem:.1f}GB\n"
+            f"Errors:\n{error_msg}"
+        )
 
     model.eval()
 
