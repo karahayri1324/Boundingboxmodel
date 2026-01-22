@@ -4,10 +4,20 @@ models/
 *.bin
 *.pt
 *.pth
+*.ckpt
+*.h5
+*.onnx
 
 # Output
 output/
 artifacts/
+
+# Docker
+.docker/
+
+# HuggingFace cache
+cache/
+huggingface/
 
 # Python
 __pycache__/

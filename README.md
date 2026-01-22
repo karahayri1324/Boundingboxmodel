@@ -1,103 +1,151 @@
-# Qwen3-VL-235B REAP Expert Pruning
+# REAP V10 - Expert Pruning for Qwen3-VL-235B
 
-Bu repo, Qwen3-VL-235B-A22B modelini REAP (Representation Efficient Activation Pruning) yontemiyle prune etmek icin gerekli tum dosyalari icerir.
+CerebrasResearch/reap uyumlu expert pruning sistemi. H200 GPU (140GB VRAM) icin optimize edilmistir.
 
-## Gereksinimler
-
-- **GPU:** NVIDIA H200 (141GB VRAM) veya benzeri
-- **RAM:** 64GB+ onerilir
-- **Disk:** ~300GB (model + output)
-
-## Hizli Baslangic (RunPod H200)
+## Hizli Baslangic
 
 ```bash
-# 1. Repo'yu klonla
-git clone https://github.com/KULLANICI_ADI/Boundingboxmodel.git
-cd Boundingboxmodel
+# 1. Docker image olustur
+./run.sh build
 
-# 2. Bagimliliklari kur
-bash setup.sh
+# 2. Interaktif shell'e gir
+./run.sh shell
 
-# 3. Modeli indir (~125GB, uzun surebilir)
-export HF_TOKEN=your_huggingface_token
-bash download_model.sh
+# 3. REAP scoring calistir
+python reap.py
 
-# 4. REAP calistir
-bash run_reap_h200.sh
+# 4. Model'i prune et
+python prune_model.py --verify
 ```
 
-## Dosya Yapisi
+## Docker Compose Kullanimi
 
-```
-Boundingboxmodel/
-├── setup.sh                 # Bagimliliklari kurar
-├── download_model.sh        # Modeli HuggingFace'den indirir
-├── run_reap_h200.sh         # Ana REAP calistirma scripti
-├── README.md                # Bu dosya
-├── reap/                    # REAP kaynak kodu
-│   └── src/reap/
-│       ├── vlm_reap.py      # VLM REAP ana modulu
-│       ├── observer.py      # MoE observer
-│       ├── prune.py         # Pruning fonksiyonlari
-│       ├── metrics.py       # Metrik hesaplamalari
-│       └── model_util.py    # Model yardimcilari
-├── reap_calibration_data/   # Kalibrasyon verisi
-│   ├── calibration_data.json
-│   └── images/              # Kalibrasyon gorselleri
-├── models/                  # (Indirilecek) Model dosyalari
-└── output/                  # (Olusturulacak) Pruned model
+```bash
+# Image olustur
+docker compose build
+
+# Interaktif shell
+docker compose run --rm reap bash
+
+# REAP calistir
+docker compose run --rm reap python reap.py
+
+# Prune calistir
+docker compose run --rm reap python prune_model.py --verify
 ```
 
-## Yapilandirma
+## Dizin Yapisi
 
-`run_reap_h200.sh` icindeki degiskenler:
+```
+/app/
+├── reap.py              # REAP scoring
+├── prune_model.py       # Model pruning
+├── test_reapv8_docker.py # Testing
+├── data/                # Mount: /mnt/vault/boundingboxtest
+│   ├── models/          # Model dosyalari
+│   └── calibration/     # Kalibrasyon verileri
+├── output/              # Cikti dizini
+├── cache/               # HuggingFace cache
+└── logs/                # Log dosyalari
+```
 
-| Degisken | Varsayilan | Aciklama |
-|----------|------------|----------|
-| MODEL_PATH | ./models/Qwen3-VL-235B-A22B-Thinking-AWQ | Model yolu |
-| CALIBRATION_PATH | ./reap_calibration_data | Kalibrasyon verisi |
-| OUTPUT_PATH | ./output/Qwen3-VL-235B-A22B-REAP-50 | Cikti yolu |
-| COMPRESSION_RATIO | 0.5 | Sikistrima orani (0.5 = %50 prune) |
-| PRUNE_METHOD | reap | Pruning yontemi |
-| NUM_SAMPLES | (bos = tumu) | Kalibrasyon ornegi sayisi |
+## Konfigurasyion
 
-## Pruning Yontemleri
+### Environment Variables
 
-| Yontem | Aciklama |
-|--------|----------|
-| `reap` | Router weight * Expert Activation Norm (varsayilan) |
-| `frequency` | Expert secilme sikligi |
-| `ean_mean` | Ortalama aktivasyon normu |
-| `weighted_ean_sum` | Agirlikli aktivasyon toplami |
+```bash
+# Model yollari
+REAP_MODEL_PATH=/app/data/models/Qwen3-VL-235B-A22B-Thinking-AWQ
+REAP_OUTPUT_PATH=/app/output/reap-v10
+REAP_CALIBRATION_PATH=/app/data/calibration/calibration_data.json
 
-## Beklenen Sonuclar
+# Pruning ayarlari
+REAP_PRUNE_RATIO=0.40      # %40 prune
+REAP_MAX_SAMPLES=300       # Kalibrasyon ornekleri
+REAP_PARALLEL_LAYERS=4     # Paralel layer sayisi
+REAP_BATCH_SIZE=4          # Batch boyutu
 
-- **Orijinal model:** 128 expert/katman, ~125GB (AWQ)
-- **Pruned model:** 64 expert/katman, ~65GB (AWQ)
-- **Islem suresi:** ~2-4 saat (H200'de)
+# H200 VRAM
+REAP_VRAM_GB=140.0         # Toplam VRAM
+REAP_VRAM_BUFFER=0.10      # %10 buffer
+```
 
-## Sorun Giderme
+### .env Dosyasi
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+## REAP Metodolojisi
+
+CerebrasResearch/reap ile uyumlu REAP score hesaplama:
+
+```
+REAP Score = mean(gate_weight * ||expert_output||_L2)
+```
+
+- **Welford's Algorithm**: Numerically stable online mean
+- **Kahan Summation**: Precision loss prevention
+- **Parallel Processing**: 4 layer ayni anda
+
+## GPU Gereksinimleri
+
+| GPU | VRAM | Parallel Layers | Batch Size |
+|-----|------|-----------------|------------|
+| H200 | 140GB | 4 | 4 |
+| H100 | 80GB | 2 | 2 |
+| A100 | 80GB | 2 | 2 |
+| A100 | 40GB | 1 | 1 |
+
+## Cikti
+
+### REAP Metadata
+
+```json
+{
+  "reap_version": "v10_cerebras_compatible",
+  "methodology": "REAP = mean(gate_weight * ||expert_output||_L2)",
+  "experts_to_keep": {"0": [1,5,8,...], "1": [2,6,9,...], ...},
+  "mean_scores": [[...], [...], ...]
+}
+```
+
+### Pruned Model
+
+```
+output/
+├── Qwen3-VL-235B-Pruned/
+│   ├── config.json           # Updated config (num_experts: 77)
+│   ├── model-*.safetensors   # Pruned weights
+│   ├── reap_metadata.json    # REAP info
+│   └── tokenizer files...
+```
+
+## Troubleshooting
 
 ### CUDA Out of Memory
+
 ```bash
-# Daha az ornek kullan
-NUM_SAMPLES=1000 bash run_reap_h200.sh
+# Parallel layer sayisini azalt
+export REAP_PARALLEL_LAYERS=2
+export REAP_BATCH_SIZE=2
 ```
 
-### Model bulunamadi
+### Slow Performance
+
 ```bash
-# Modeli indirdiginizden emin olun
-bash download_model.sh
+# Flash Attention aktif mi kontrol et
+python -c "from flash_attn import flash_attn_func; print('OK')"
 ```
 
-### HuggingFace token hatasi
+### Model Yukleme Hatasi
+
 ```bash
-# Token'i ayarlayin
-export HF_TOKEN=hf_xxxxxxxxxxxxx
-huggingface-cli login --token $HF_TOKEN
+# Model dosyalarini kontrol et
+ls -la /app/data/models/Qwen3-VL-235B-A22B-Thinking-AWQ/
 ```
 
-## Referanslar
+## Lisans
 
-- [REAP Paper](https://arxiv.org/abs/...)
-- [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B)
+MIT License
