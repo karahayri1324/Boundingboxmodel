@@ -1,151 +1,147 @@
-# REAP V10 - Expert Pruning for Qwen3-VL-235B
+# REAP V11 - Fixed VLM Expert Pruning
 
-CerebrasResearch/reap uyumlu expert pruning sistemi. H200 GPU (140GB VRAM) icin optimize edilmistir.
+Router-weighted Expert Activation Pruning for Vision-Language MoE models.
 
-## Hizli Baslangic
+**Based on [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap)**
+
+## 🚨 Critical Fix from V10
+
+**V10 had a critical bug**: `compute_all_experts=False` meant only top-k experts were scored, giving **wrong importance values**.
+
+**V11 fixes this**: Now computes ALL 128 expert outputs for accurate REAP scoring.
+
+```python
+# V10 (WRONG)
+compute_all_experts=False  # Only scored ~8 experts per token
+
+# V11 (CORRECT)  
+compute_all_experts=True   # Scores ALL 128 experts
+```
+
+## Quick Start
 
 ```bash
-# 1. Docker image olustur
+# 1. Build Docker
 ./run.sh build
 
-# 2. Interaktif shell'e gir
-./run.sh shell
+# 2. Run REAP scoring (FULL mode - accurate)
+./run.sh reap
 
-# 3. REAP scoring calistir
-python reap.py
+# 3. Prune model
+./run.sh prune
 
-# 4. Model'i prune et
-python prune_model.py --verify
+# 4. Test
+./run.sh test
 ```
 
-## Docker Compose Kullanimi
+## Scoring Modes
+
+| Mode | Accuracy | Speed | Use Case |
+|------|----------|-------|----------|
+| `full` | ✅ High | 🐢 Slow | Production pruning |
+| `router` | ⚠️ Approximate | 🚀 Fast | Quick experiments |
+
+Set mode via environment:
+```bash
+export REAP_SCORING_MODE=full    # Default, recommended
+export REAP_SCORING_MODE=router  # Fast approximation
+```
+
+## How REAP Works
+
+```
+REAP Score = mean(router_probability × ||expert_output||_L2)
+```
+
+1. **Router Probability**: How likely the router selects this expert
+2. **Output Norm**: How much the expert contributes when selected
+3. **Combined**: Experts with high prob AND high output are important
+
+## Configuration
 
 ```bash
-# Image olustur
-docker compose build
-
-# Interaktif shell
-docker compose run --rm reap bash
-
-# REAP calistir
-docker compose run --rm reap python reap.py
-
-# Prune calistir
-docker compose run --rm reap python prune_model.py --verify
-```
-
-## Dizin Yapisi
-
-```
-/app/
-├── reap.py              # REAP scoring
-├── prune_model.py       # Model pruning
-├── test_reapv8_docker.py # Testing
-├── data/                # Mount: /mnt/vault/boundingboxtest
-│   ├── models/          # Model dosyalari
-│   └── calibration/     # Kalibrasyon verileri
-├── output/              # Cikti dizini
-├── cache/               # HuggingFace cache
-└── logs/                # Log dosyalari
-```
-
-## Konfigurasyion
-
-### Environment Variables
-
-```bash
-# Model yollari
-REAP_MODEL_PATH=/app/data/models/Qwen3-VL-235B-A22B-Thinking-AWQ
-REAP_OUTPUT_PATH=/app/output/reap-v10
-REAP_CALIBRATION_PATH=/app/data/calibration/calibration_data.json
-
-# Pruning ayarlari
-REAP_PRUNE_RATIO=0.40      # %40 prune
-REAP_MAX_SAMPLES=300       # Kalibrasyon ornekleri
-REAP_PARALLEL_LAYERS=4     # Paralel layer sayisi
-REAP_BATCH_SIZE=4          # Batch boyutu
-
-# H200 VRAM
-REAP_VRAM_GB=140.0         # Toplam VRAM
-REAP_VRAM_BUFFER=0.10      # %10 buffer
-```
-
-### .env Dosyasi
-
-```bash
+# Copy and edit
 cp .env.example .env
-nano .env
+
+# Key settings
+REAP_MODEL_PATH=/path/to/model
+REAP_PRUNE_RATIO=0.40        # Prune 40% of experts
+REAP_SCORING_MODE=full       # full or router
+REAP_MAX_SAMPLES=300         # Calibration samples
 ```
 
-## REAP Metodolojisi
-
-CerebrasResearch/reap ile uyumlu REAP score hesaplama:
+## Directory Structure
 
 ```
-REAP Score = mean(gate_weight * ||expert_output||_L2)
+reap-vlm-fixed/
+├── reap.py              # Main REAP scoring (FIXED)
+├── prune_model.py       # Model pruning
+├── test_pruned_model.py # Testing
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── run.sh
 ```
 
-- **Welford's Algorithm**: Numerically stable online mean
-- **Kahan Summation**: Precision loss prevention
-- **Parallel Processing**: 4 layer ayni anda
+## Output
 
-## GPU Gereksinimleri
-
-| GPU | VRAM | Parallel Layers | Batch Size |
-|-----|------|-----------------|------------|
-| H200 | 140GB | 4 | 4 |
-| H100 | 80GB | 2 | 2 |
-| A100 | 80GB | 2 | 2 |
-| A100 | 40GB | 1 | 1 |
-
-## Cikti
-
-### REAP Metadata
-
-```json
-{
-  "reap_version": "v10_cerebras_compatible",
-  "methodology": "REAP = mean(gate_weight * ||expert_output||_L2)",
-  "experts_to_keep": {"0": [1,5,8,...], "1": [2,6,9,...], ...},
-  "mean_scores": [[...], [...], ...]
-}
-```
-
-### Pruned Model
+After running:
 
 ```
 output/
-├── Qwen3-VL-235B-Pruned/
-│   ├── config.json           # Updated config (num_experts: 77)
-│   ├── model-*.safetensors   # Pruned weights
-│   ├── reap_metadata.json    # REAP info
-│   └── tokenizer files...
+├── reap_metadata.json    # REAP scores & experts to keep
+└── Pruned-Model/
+    ├── config.json       # Updated (num_experts reduced)
+    ├── model-*.safetensors
+    └── reap_metadata.json
 ```
 
 ## Troubleshooting
 
-### CUDA Out of Memory
+### "a a a a a" output from pruned model
+
+This usually means:
+1. Wrong experts were pruned (V10 bug - use V11)
+2. Gate weights corrupted
+3. Calibration data too narrow
+
+**Solution**: Re-run with V11's `REAP_SCORING_MODE=full`
+
+### CUDA OOM
 
 ```bash
-# Parallel layer sayisini azalt
-export REAP_PARALLEL_LAYERS=2
-export REAP_BATCH_SIZE=2
+# Reduce batch size
+export REAP_BATCH_SIZE=1
+
+# Use router-only mode (less accurate but faster)
+export REAP_SCORING_MODE=router
 ```
 
-### Slow Performance
+### Zero-count experts warning
 
-```bash
-# Flash Attention aktif mi kontrol et
-python -c "from flash_attn import flash_attn_func; print('OK')"
+If analysis shows many zero-count experts:
+- Ensure `REAP_SCORING_MODE=full`
+- Check calibration data has diverse samples
+
+## Differences from CerebrasResearch/reap
+
+| Feature | CerebrasResearch | This Repo |
+|---------|------------------|-----------|
+| Model Type | Text-only LLM | Vision-Language |
+| Vision Encoder | ❌ | ✅ Preserved |
+| Calibration | Text | Text + Images |
+| Quantization | FP16/BF16 | AWQ support |
+
+## Citation
+
+```bibtex
+@misc{reap-vlm,
+    title = {REAP V11: Fixed VLM Expert Pruning},
+    note = {Based on CerebrasResearch/reap},
+    url = {https://github.com/CerebrasResearch/reap}
+}
 ```
 
-### Model Yukleme Hatasi
-
-```bash
-# Model dosyalarini kontrol et
-ls -la /app/data/models/Qwen3-VL-235B-A22B-Thinking-AWQ/
-```
-
-## Lisans
+## License
 
 MIT License

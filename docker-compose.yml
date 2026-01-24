@@ -1,7 +1,5 @@
 # =============================================================================
-# REAP V10 - Docker Compose Configuration
-# =============================================================================
-# H200 GPU Optimized for Qwen3-VL-235B Expert Pruning
+# REAP V11 - Docker Compose
 # =============================================================================
 
 services:
@@ -9,14 +7,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: reap-v10:latest
-    container_name: reap-v10
-
-    # Interactive mode
+    image: reap-v11:latest
+    container_name: reap-v11
+    
     stdin_open: true
     tty: true
-
-    # GPU Access - H200
+    
     deploy:
       resources:
         reservations:
@@ -24,82 +20,44 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
-    # Shared memory for PyTorch DataLoader
+    
     shm_size: '32gb'
-
-    # Environment Variables
+    
     environment:
-      # CUDA
       - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-
-      # PyTorch Memory
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
-
-      # HuggingFace
       - HF_HOME=/app/cache/huggingface
-      - TRANSFORMERS_CACHE=/app/cache/transformers
       - HF_TOKEN=${HF_TOKEN:-}
-
+      
       # REAP Config
       - REAP_MODEL_PATH=/app/data/models/Qwen3-VL-235B-A22B-Thinking-AWQ
-      - REAP_OUTPUT_PATH=/app/output/reap-v10
+      - REAP_OUTPUT_PATH=/app/output/reap-v11
       - REAP_CALIBRATION_PATH=/app/data/calibration/calibration_data.json
+      - REAP_PRUNED_OUTPUT_PATH=/app/output/Qwen3-VL-Pruned-V11
       - REAP_PRUNE_RATIO=0.40
-      - REAP_PARALLEL_LAYERS=4
-      - REAP_BATCH_SIZE=4
+      - REAP_SCORING_MODE=full
+      - REAP_MAX_SAMPLES=300
+      - REAP_BATCH_SIZE=1
       - REAP_VRAM_GB=140
-      - REAP_VRAM_BUFFER=0.10
-
-    # Volume Mounts
+    
     volumes:
-      # Model files (read-only for safety)
       - /mnt/vault/boundingboxtest:/app/data:rw
-
-      # Output directory
       - ./output:/app/output:rw
-
-      # Cache (persistent)
       - reap-cache:/app/cache
-
-      # Logs
-      - ./logs:/app/logs:rw
-
-      # Scripts (for development)
       - ./reap.py:/app/reap.py:ro
       - ./prune_model.py:/app/prune_model.py:ro
-      - ./test_reapv8_docker.py:/app/test_reapv8_docker.py:ro
-
-    # Working directory
+      - ./test_pruned_model.py:/app/test_pruned_model.py:ro
+    
     working_dir: /app
-
-    # Ulimits for large models
+    
     ulimits:
       memlock:
         soft: -1
         hard: -1
-      stack:
-        soft: 67108864
-        hard: 67108864
-
-    # Network
+    
     network_mode: host
 
-    # Restart policy
-    restart: unless-stopped
-
-    # Health check
-    healthcheck:
-      test: ["CMD", "python", "-c", "import torch; assert torch.cuda.is_available()"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-
-# =============================================================================
-# Named Volumes
-# =============================================================================
 volumes:
   reap-cache:
     driver: local
