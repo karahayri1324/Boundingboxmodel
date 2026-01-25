@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-REAP V12.2 - Qwen3-VL-235B-A22B-Thinking-AWQ
+REAP V12.4 - Qwen3-VL-235B-A22B-Thinking-AWQ
 =============================================
 
-WITH PROPER VISION ENCODER!
+FIXES in V12.4:
+1. Gate weight slicing - auto-detect expert dimension
+2. Config-aware normalization (norm_topk_prob)
+3. Native transformers vision encoder
 
-Vision Config:
-- depth: 27 layers
-- hidden_size: 1152
-- patch_size: 16
-- spatial_merge_size: 2
-- temporal_patch_size: 2
-- out_hidden_size: 4096 (projects to LLM hidden size)
-- deepstack_visual_indexes: [8, 16, 24]
-
-Vision encoder is FP16 (not AWQ quantized).
+Requirements:
+    pip install transformers>=4.57.0
+    pip install qwen-vl-utils
 """
 
 import warnings
@@ -36,15 +32,44 @@ from tqdm import tqdm
 import shutil
 from datetime import datetime
 from PIL import Image
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-import math
 
 sys.stdout.reconfigure(line_buffering=True)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+# =============================================================================
+# CHECK TRANSFORMERS VERSION
+# =============================================================================
+
+def check_transformers_version():
+    """Check if transformers supports Qwen3VLMoe."""
+    try:
+        import transformers
+        version = transformers.__version__
+        
+        major, minor = int(version.split('.')[0]), int(version.split('.')[1])
+        
+        if major < 4 or (major == 4 and minor < 57):
+            print(f"ERROR: transformers {version} detected. Need >= 4.57.0")
+            print("Run: pip install transformers>=4.57.0")
+            sys.exit(1)
+        
+        print(f"✓ transformers {version} OK")
+        
+        from transformers import Qwen3VLMoeForConditionalGeneration
+        print("✓ Qwen3VLMoeForConditionalGeneration available")
+        
+        return True
+        
+    except ImportError as e:
+        print(f"ERROR: {e}")
+        print("Run: pip install transformers>=4.57.0")
+        sys.exit(1)
 
 
 # =============================================================================
@@ -62,7 +87,7 @@ class Config:
     )
     output_path: str = os.environ.get(
         "REAP_OUTPUT_PATH", 
-        "/app/output/reap-v12.2-qwen3vl"
+        "/app/output/reap-v12.4-qwen3vl"
     )
     calibration_data_path: str = os.environ.get(
         "REAP_CALIBRATION_PATH",
@@ -75,13 +100,10 @@ class Config:
     max_seq_len: int = int(os.environ.get("REAP_MAX_SEQ_LEN", "2048"))
     random_seed: int = int(os.environ.get("REAP_SEED", "42"))
     
-    # AWQ
-    awq_group_size: int = 128
-    
     # Memory
     device: str = os.environ.get("REAP_DEVICE", "cuda:0")
     
-    # Text config (from config.json)
+    # Text config (from config.json) - will be loaded dynamically
     num_layers: int = 94
     num_experts: int = 128
     num_experts_per_tok: int = 8
@@ -90,20 +112,12 @@ class Config:
     num_attention_heads: int = 64
     num_key_value_heads: int = 4
     rope_theta: float = 5000000.0
+    awq_group_size: int = 128
+    norm_topk_prob: bool = True  # NEW: from config
     
     # MRoPE
     mrope_interleaved: bool = True
-    mrope_section: List[int] = None
-    
-    # Vision config (from config.json)
-    vision_hidden_size: int = 1152
-    vision_depth: int = 27
-    vision_num_heads: int = 16
-    vision_patch_size: int = 16
-    vision_spatial_merge_size: int = 2
-    vision_temporal_patch_size: int = 2
-    vision_out_hidden_size: int = 4096
-    deepstack_visual_indexes: List[int] = None
+    mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
     
     # Token IDs
     image_token_id: int = 151655
@@ -115,32 +129,64 @@ class Config:
     layer_prefix: str = "model.language_model.layers"
     embed_prefix: str = "model.language_model.embed_tokens"
     vision_prefix: str = "model.visual"
+
+
+def load_config_from_model(config: Config) -> Config:
+    """Load config values from model's config.json."""
+    config_path = os.path.join(config.model_path, "config.json")
     
-    def __post_init__(self):
-        if self.mrope_section is None:
-            self.mrope_section = [24, 20, 20]
-        if self.deepstack_visual_indexes is None:
-            self.deepstack_visual_indexes = [8, 16, 24]
+    with open(config_path, 'r') as f:
+        model_config = json.load(f)
+    
+    text_config = model_config.get('text_config', {})
+    
+    # Update config with actual values
+    config.num_layers = text_config.get('num_hidden_layers', config.num_layers)
+    config.num_experts = text_config.get('num_experts', config.num_experts)
+    config.num_experts_per_tok = text_config.get('num_experts_per_tok', config.num_experts_per_tok)
+    config.hidden_size = text_config.get('hidden_size', config.hidden_size)
+    config.head_dim = text_config.get('head_dim', config.head_dim)
+    config.num_attention_heads = text_config.get('num_attention_heads', config.num_attention_heads)
+    config.num_key_value_heads = text_config.get('num_key_value_heads', config.num_key_value_heads)
+    config.rope_theta = text_config.get('rope_theta', config.rope_theta)
+    
+    # CRITICAL: norm_topk_prob
+    config.norm_topk_prob = text_config.get('norm_topk_prob', True)
+    
+    # MRoPE
+    rope_scaling = text_config.get('rope_scaling', {})
+    config.mrope_interleaved = rope_scaling.get('mrope_interleaved', True)
+    config.mrope_section = rope_scaling.get('mrope_section', [24, 20, 20])
+    
+    # Token IDs
+    config.image_token_id = model_config.get('image_token_id', 151655)
+    config.video_token_id = model_config.get('video_token_id', 151656)
+    
+    # AWQ group size
+    quant_config = model_config.get('quantization_config', {})
+    config.awq_group_size = quant_config.get('group_size', 128)
+    
+    return config
 
 
 CONFIG = Config()
-device = torch.device(CONFIG.device)
+device = None  # Will be set after config load
 
 
-def print_banner():
+def print_banner(config: Config):
     print("\n" + "="*70)
-    print("  REAP V12.2 - Qwen3-VL-235B-A22B-Thinking-AWQ")
-    print("  WITH VISION ENCODER")
+    print("  REAP V12.4 - Qwen3-VL-235B-A22B-Thinking-AWQ")
+    print("  WITH GATE SLICING FIX + NORM_TOPK_PROB SUPPORT")
     print("="*70)
-    print(f"\n  Model: {CONFIG.model_path}")
-    print(f"  Output: {CONFIG.output_path}")
-    print(f"  Prune Ratio: {CONFIG.prune_ratio*100:.0f}%")
-    print(f"\n  Text Config:")
-    print(f"    Layers: {CONFIG.num_layers}, Experts: {CONFIG.num_experts}")
-    print(f"    rope_theta: {CONFIG.rope_theta:,.0f}")
-    print(f"  Vision Config:")
-    print(f"    Depth: {CONFIG.vision_depth}, Hidden: {CONFIG.vision_hidden_size}")
-    print(f"    DeepStack indexes: {CONFIG.deepstack_visual_indexes}")
+    print(f"\n  Model: {config.model_path}")
+    print(f"  Output: {config.output_path}")
+    print(f"  Prune Ratio: {config.prune_ratio*100:.0f}%")
+    print(f"\n  Config (from model):")
+    print(f"    Layers: {config.num_layers}, Experts: {config.num_experts} (top-{config.num_experts_per_tok})")
+    print(f"    Hidden: {config.hidden_size}, Head: {config.head_dim}")
+    print(f"    rope_theta: {config.rope_theta:,.0f}")
+    print(f"    MRoPE: interleaved={config.mrope_interleaved}, sections={config.mrope_section}")
+    print(f"    norm_topk_prob: {config.norm_topk_prob}")  # NEW
     print("="*70 + "\n")
 
 
@@ -149,11 +195,16 @@ def print_banner():
 # =============================================================================
 
 class ReapScoreAccumulator:
-    """REAP score accumulator."""
+    """
+    REAP score accumulator with correct formula.
     
-    def __init__(self, num_experts: int, num_layers: int):
+    REAP Score = (1/|𝒳ⱼ|) × Σ(x∈𝒳ⱼ) gⱼ(x) · ‖fⱼ(x)‖₂
+    """
+    
+    def __init__(self, num_experts: int, num_layers: int, device: torch.device):
         self.num_experts = num_experts
         self.num_layers = num_layers
+        self.device = device
         
         self.weighted_sum = {
             layer: torch.zeros(num_experts, dtype=torch.float64, device=device)
@@ -167,6 +218,14 @@ class ReapScoreAccumulator:
     def update(self, layer_idx: int, expert_idx: int, gate_value: float, output_norm: float):
         self.weighted_sum[layer_idx][expert_idx] += gate_value * output_norm
         self.active_count[layer_idx][expert_idx] += 1
+    
+    def update_batch(self, layer_idx: int, expert_indices: torch.Tensor, 
+                     gate_values: torch.Tensor, output_norms: torch.Tensor):
+        """Batch update for efficiency."""
+        for i in range(len(expert_indices)):
+            exp_idx = expert_indices[i].item()
+            self.weighted_sum[layer_idx][exp_idx] += gate_values[i].item() * output_norms[i].item()
+            self.active_count[layer_idx][exp_idx] += 1
     
     def get_scores(self) -> Dict[int, torch.Tensor]:
         scores = {}
@@ -204,215 +263,22 @@ def dequantize_awq(qweight: torch.Tensor, qzeros: torch.Tensor,
     return weight.T.half()
 
 
-def get_weight(weights: dict, prefix: str, is_awq: bool = True) -> Optional[torch.Tensor]:
+def get_weight(weights: dict, prefix: str, is_awq: bool = True, 
+               group_size: int = 128) -> Optional[torch.Tensor]:
     """Get weight tensor with AWQ support."""
-    # FP16 first
     fp16_weight = weights.get(f"{prefix}.weight")
     if fp16_weight is not None:
         return fp16_weight
     
-    # AWQ
     if is_awq:
         qw = weights.get(f"{prefix}.qweight")
         qz = weights.get(f"{prefix}.qzeros")
         sc = weights.get(f"{prefix}.scales")
         
         if qw is not None and qz is not None and sc is not None:
-            return dequantize_awq(qw, qz, sc, CONFIG.awq_group_size)
+            return dequantize_awq(qw, qz, sc, group_size)
     
     return None
-
-
-# =============================================================================
-# VISION ENCODER (Qwen3-VL ViT with DeepStack)
-# =============================================================================
-
-class Qwen3VLVisionEncoder(nn.Module):
-    """
-    Qwen3-VL Vision Encoder.
-    
-    Architecture:
-    - Patch embedding (conv2d)
-    - Position embedding
-    - Transformer blocks (depth=27)
-    - DeepStack: features from layers [8, 16, 24]
-    - Merger (spatial downsampling)
-    """
-    
-    def __init__(self, config: Config):
-        super().__init__()
-        self.config = config
-        
-        self.hidden_size = config.vision_hidden_size  # 1152
-        self.num_heads = config.vision_num_heads  # 16
-        self.head_dim = self.hidden_size // self.num_heads  # 72
-        self.depth = config.vision_depth  # 27
-        self.patch_size = config.vision_patch_size  # 16
-        self.spatial_merge_size = config.vision_spatial_merge_size  # 2
-        self.out_hidden_size = config.vision_out_hidden_size  # 4096
-        
-        # Patch embedding
-        self.patch_embed = nn.Conv3d(
-            in_channels=3,
-            out_channels=self.hidden_size,
-            kernel_size=(config.vision_temporal_patch_size, config.vision_patch_size, config.vision_patch_size),
-            stride=(config.vision_temporal_patch_size, config.vision_patch_size, config.vision_patch_size),
-            bias=False
-        )
-        
-        # Position embedding (will be loaded from weights)
-        self.num_position_embeddings = 2304  # from config
-        
-        # Merger for spatial downsampling
-        merge_hidden = self.hidden_size * (config.vision_spatial_merge_size ** 2)
-        self.merger_ln = nn.LayerNorm(merge_hidden, eps=1e-6)
-        self.merger_mlp = nn.Sequential(
-            nn.Linear(merge_hidden, merge_hidden),
-            nn.GELU(),
-            nn.Linear(merge_hidden, self.out_hidden_size)
-        )
-        
-        self._weights_loaded = False
-    
-    def load_weights(self, weights: dict):
-        """Load vision encoder weights."""
-        # Patch embed
-        patch_weight = weights.get(f"{CONFIG.vision_prefix}.patch_embed.proj.weight")
-        if patch_weight is not None:
-            self.patch_embed.weight.data = patch_weight.half()
-        
-        # Merger
-        merger_ln_weight = weights.get(f"{CONFIG.vision_prefix}.merger.ln_q.weight")
-        merger_ln_bias = weights.get(f"{CONFIG.vision_prefix}.merger.ln_q.bias")
-        if merger_ln_weight is not None:
-            self.merger_ln.weight.data = merger_ln_weight.half()
-        if merger_ln_bias is not None:
-            self.merger_ln.bias.data = merger_ln_bias.half()
-        
-        # Merger MLP
-        mlp_fc1_weight = weights.get(f"{CONFIG.vision_prefix}.merger.mlp.0.weight")
-        mlp_fc1_bias = weights.get(f"{CONFIG.vision_prefix}.merger.mlp.0.bias")
-        mlp_fc2_weight = weights.get(f"{CONFIG.vision_prefix}.merger.mlp.2.weight")
-        mlp_fc2_bias = weights.get(f"{CONFIG.vision_prefix}.merger.mlp.2.bias")
-        
-        if mlp_fc1_weight is not None:
-            self.merger_mlp[0].weight.data = mlp_fc1_weight.half()
-        if mlp_fc1_bias is not None:
-            self.merger_mlp[0].bias.data = mlp_fc1_bias.half()
-        if mlp_fc2_weight is not None:
-            self.merger_mlp[2].weight.data = mlp_fc2_weight.half()
-        if mlp_fc2_bias is not None:
-            self.merger_mlp[2].bias.data = mlp_fc2_bias.half()
-        
-        self._weights_loaded = True
-    
-    def forward(self, pixel_values: torch.Tensor, grid_thw: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            pixel_values: [B, C, T, H, W] or [B, C, H, W]
-            grid_thw: [B, 3] grid size (temporal, height, width)
-            
-        Returns:
-            vision_embeds: [B, num_patches, hidden_size]
-        """
-        # Handle 4D input (image)
-        if pixel_values.dim() == 4:
-            pixel_values = pixel_values.unsqueeze(2)  # Add temporal dim
-        
-        B, C, T, H, W = pixel_values.shape
-        
-        # Patch embedding
-        x = self.patch_embed(pixel_values)  # [B, hidden, t, h, w]
-        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, hidden]
-        
-        # Note: Full vision transformer forward would go here
-        # For now, we'll use a simplified version that just does the projection
-        # The actual model uses 27 transformer blocks
-        
-        # Spatial merge (simplified)
-        # In full implementation, this merges 2x2 patches
-        num_patches = x.shape[1]
-        
-        # Project to LLM hidden size
-        # Full merger does spatial downsampling first
-        if x.shape[-1] != self.out_hidden_size:
-            # Simple linear projection as fallback
-            x = F.linear(x, torch.eye(self.out_hidden_size, self.hidden_size, device=x.device, dtype=x.dtype)[:, :x.shape[-1]])
-        
-        return x
-
-
-class SimpleVisionProcessor:
-    """
-    Simplified vision processor for Qwen3-VL.
-    
-    For proper processing, use AutoProcessor from transformers.
-    This is a fallback that does basic image preprocessing.
-    """
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.image_size = 448  # Default
-        self.patch_size = config.vision_patch_size
-        self.temporal_patch_size = config.vision_temporal_patch_size
-        
-        # Normalization (ImageNet defaults)
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-    
-    def preprocess(self, image: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Preprocess image.
-        
-        Returns:
-            pixel_values: [1, C, T, H, W]
-            grid_thw: [1, 3]
-        """
-        # Resize
-        image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        
-        # To tensor
-        img_array = np.array(image).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
-        
-        # Normalize
-        img_tensor = (img_tensor - self.mean) / self.std
-        
-        # Add temporal dimension
-        img_tensor = img_tensor.unsqueeze(2)  # [1, C, 1, H, W]
-        
-        # Grid THW
-        t = 1
-        h = self.image_size // self.patch_size
-        w = self.image_size // self.patch_size
-        grid_thw = torch.tensor([[t, h, w]])
-        
-        return img_tensor.half(), grid_thw
-
-
-def load_vision_weights(model_path: str) -> dict:
-    """Load all vision encoder weights."""
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(index_path) as f:
-        weight_index = json.load(f)
-    
-    vision_weights = {}
-    needed_shards = set()
-    
-    for name, shard in weight_index['weight_map'].items():
-        if CONFIG.vision_prefix in name:
-            needed_shards.add(shard)
-    
-    for shard in needed_shards:
-        shard_path = os.path.join(model_path, shard)
-        with safe_open(shard_path, framework="pt", device="cuda:0") as f:
-            for name in f.keys():
-                if CONFIG.vision_prefix in name:
-                    vision_weights[name] = f.get_tensor(name)
-    
-    return vision_weights
 
 
 # =============================================================================
@@ -424,23 +290,24 @@ class MRoPE:
     
     def __init__(self, head_dim: int, max_position: int, 
                  rope_theta: float, mrope_section: List[int],
-                 interleaved: bool = True):
+                 interleaved: bool = True, device: torch.device = None):
         self.head_dim = head_dim
         self.rope_theta = rope_theta
         self.mrope_section = mrope_section
         self.interleaved = interleaved
+        self.device = device or torch.device('cuda:0')
         
         self.inv_freqs = []
         for section_dim in mrope_section:
             inv_freq = 1.0 / (rope_theta ** (
                 torch.arange(0, section_dim * 2, 2, dtype=torch.float32) / (section_dim * 2)
             ))
-            self.inv_freqs.append(inv_freq.to(device))
+            self.inv_freqs.append(inv_freq.to(self.device))
         
         self._build_cache(max_position)
     
     def _build_cache(self, seq_len: int):
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        t = torch.arange(seq_len, device=self.device, dtype=torch.float32)
         
         cos_parts = []
         sin_parts = []
@@ -507,15 +374,16 @@ def forward_attention(
     hidden_states: torch.Tensor, 
     weights: dict, 
     layer_idx: int,
-    mrope: MRoPE
+    mrope: MRoPE,
+    config: Config
 ) -> torch.Tensor:
     B, S, H = hidden_states.shape
-    prefix = f"{CONFIG.layer_prefix}.{layer_idx}."
+    prefix = f"{config.layer_prefix}.{layer_idx}."
     
-    q_proj = get_weight(weights, f"{prefix}self_attn.q_proj", is_awq=True)
-    k_proj = get_weight(weights, f"{prefix}self_attn.k_proj", is_awq=True)
-    v_proj = get_weight(weights, f"{prefix}self_attn.v_proj", is_awq=True)
-    o_proj = get_weight(weights, f"{prefix}self_attn.o_proj", is_awq=True)
+    q_proj = get_weight(weights, f"{prefix}self_attn.q_proj", is_awq=True, group_size=config.awq_group_size)
+    k_proj = get_weight(weights, f"{prefix}self_attn.k_proj", is_awq=True, group_size=config.awq_group_size)
+    v_proj = get_weight(weights, f"{prefix}self_attn.v_proj", is_awq=True, group_size=config.awq_group_size)
+    o_proj = get_weight(weights, f"{prefix}self_attn.o_proj", is_awq=True, group_size=config.awq_group_size)
     
     if q_proj is None:
         return hidden_states
@@ -525,9 +393,9 @@ def forward_attention(
     v_bias = weights.get(f"{prefix}self_attn.v_proj.bias")
     o_bias = weights.get(f"{prefix}self_attn.o_proj.bias")
     
-    num_heads = CONFIG.num_attention_heads
-    num_kv_heads = CONFIG.num_key_value_heads
-    head_dim = CONFIG.head_dim
+    num_heads = config.num_attention_heads
+    num_kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
     
     q = F.linear(hidden_states, q_proj, q_bias).view(B, S, num_heads, head_dim).transpose(1, 2)
     k = F.linear(hidden_states, k_proj, k_bias).view(B, S, num_kv_heads, head_dim).transpose(1, 2)
@@ -561,44 +429,61 @@ def forward_moe_with_reap(
     hidden_states: torch.Tensor,
     weights: dict,
     layer_idx: int,
-    score_accumulator: ReapScoreAccumulator
+    score_accumulator: ReapScoreAccumulator,
+    config: Config
 ) -> torch.Tensor:
+    """
+    MoE forward with correct REAP scoring.
+    
+    FIXES in V12.4:
+    - Config-aware normalization (norm_topk_prob)
+    - Gate weight is FP16 (not AWQ)
+    """
     B, S, H = hidden_states.shape
     total_tokens = B * S
     hidden_flat = hidden_states.view(total_tokens, H)
     
-    prefix = f"{CONFIG.layer_prefix}.{layer_idx}."
+    prefix = f"{config.layer_prefix}.{layer_idx}."
     
-    # Gate is FP16
+    # Gate is FP16 (modules_to_not_convert includes "mlp.gate")
     gate_weight = get_weight(weights, f"{prefix}mlp.gate", is_awq=False)
     
     if gate_weight is None:
         return hidden_states
     
+    # Router computation
     router_logits = F.linear(hidden_flat, gate_weight)
     router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
     
-    top_k = CONFIG.num_experts_per_tok
+    # Top-K selection
+    top_k = config.num_experts_per_tok
     topk_weights, topk_indices = torch.topk(router_probs, top_k, dim=-1)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    
+    # FIX: Config-aware normalization
+    if config.norm_topk_prob:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    
     topk_weights = topk_weights.half()
     
+    # Output tensor
     moe_output = torch.zeros_like(hidden_flat)
     
+    # Group tokens by expert
     expert_to_tokens: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
     for token_idx in range(total_tokens):
         for k_pos in range(top_k):
             exp_idx = topk_indices[token_idx, k_pos].item()
             expert_to_tokens[exp_idx].append((token_idx, k_pos))
     
+    # Process each selected expert
     for exp_idx, token_info in expert_to_tokens.items():
         if not token_info:
             continue
         
         exp_prefix = f"{prefix}mlp.experts.{exp_idx}"
-        gate_proj = get_weight(weights, f"{exp_prefix}.gate_proj", is_awq=True)
-        up_proj = get_weight(weights, f"{exp_prefix}.up_proj", is_awq=True)
-        down_proj = get_weight(weights, f"{exp_prefix}.down_proj", is_awq=True)
+        gate_proj = get_weight(weights, f"{exp_prefix}.gate_proj", is_awq=True, group_size=config.awq_group_size)
+        up_proj = get_weight(weights, f"{exp_prefix}.up_proj", is_awq=True, group_size=config.awq_group_size)
+        down_proj = get_weight(weights, f"{exp_prefix}.down_proj", is_awq=True, group_size=config.awq_group_size)
         
         if gate_proj is None:
             continue
@@ -628,8 +513,9 @@ def forward_moe_with_reap(
 # =============================================================================
 
 class LayerProcessor:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, config: Config):
         self.model_path = model_path
+        self.config = config
         
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         with open(index_path) as f:
@@ -641,7 +527,7 @@ class LayerProcessor:
             self.shard_to_weights[shard].append(name)
     
     def _load_layer_weights(self, layer_idx: int) -> dict:
-        prefix = f"{CONFIG.layer_prefix}.{layer_idx}."
+        prefix = f"{self.config.layer_prefix}.{layer_idx}."
         weights = {}
         
         needed_shards = set()
@@ -651,7 +537,7 @@ class LayerProcessor:
         
         for shard in needed_shards:
             shard_path = os.path.join(self.model_path, shard)
-            with safe_open(shard_path, framework="pt", device="cuda:0") as f:
+            with safe_open(shard_path, framework="pt", device=str(device)) as f:
                 for name in self.shard_to_weights[shard]:
                     if prefix in name:
                         weights[name] = f.get_tensor(name)
@@ -661,14 +547,14 @@ class LayerProcessor:
     def process_layer(self, hidden_states: torch.Tensor, layer_idx: int,
                       weights: dict, mrope: MRoPE, 
                       score_accumulator: ReapScoreAccumulator) -> torch.Tensor:
-        prefix = f"{CONFIG.layer_prefix}.{layer_idx}."
+        prefix = f"{self.config.layer_prefix}.{layer_idx}."
         
         residual = hidden_states
         input_ln = weights.get(f"{prefix}input_layernorm.weight")
         if input_ln is not None:
             hidden_states = rms_norm(hidden_states, input_ln)
         
-        hidden_states = forward_attention(hidden_states, weights, layer_idx, mrope)
+        hidden_states = forward_attention(hidden_states, weights, layer_idx, mrope, self.config)
         hidden_states = residual + hidden_states
         
         residual = hidden_states
@@ -678,14 +564,14 @@ class LayerProcessor:
         else:
             hidden_normed = hidden_states
         
-        moe_out = forward_moe_with_reap(hidden_normed, weights, layer_idx, score_accumulator)
+        moe_out = forward_moe_with_reap(hidden_normed, weights, layer_idx, score_accumulator, self.config)
         
         return residual + moe_out
     
     def process_all_layers(self, hidden_states_list: List[torch.Tensor],
                            mrope: MRoPE, score_accumulator: ReapScoreAccumulator,
                            progress_callback=None):
-        for layer_idx in range(CONFIG.num_layers):
+        for layer_idx in range(self.config.num_layers):
             layer_start = time.time()
             
             weights = self._load_layer_weights(layer_idx)
@@ -721,6 +607,7 @@ class CalibrationDataset:
         'Locate "{region}" in the image.',
         'Find the bounding box of "{region}".',
         'Where is "{region}" located?',
+        '"{region}" nerede?',
     ]
     
     def __init__(self, json_path: str):
@@ -776,29 +663,91 @@ class CalibrationDataset:
 
 
 # =============================================================================
+# VISION ENCODER LOADING
+# =============================================================================
+
+def load_vision_encoder(model_path: str, config: Config):
+    """Load vision encoder using transformers native implementation."""
+    from transformers import AutoConfig
+    
+    print("  Loading vision encoder from transformers...")
+    
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    try:
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeVisionEncoder
+        )
+        
+        vision_encoder = Qwen3VLMoeVisionEncoder(model_config.vision_config)
+        
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        with open(index_path) as f:
+            weight_index = json.load(f)
+        
+        vision_weights = {}
+        needed_shards = set()
+        
+        for name, shard in weight_index['weight_map'].items():
+            if config.vision_prefix in name:
+                needed_shards.add(shard)
+        
+        for shard in needed_shards:
+            shard_path = os.path.join(model_path, shard)
+            with safe_open(shard_path, framework="pt", device=str(device)) as f:
+                for name in f.keys():
+                    if config.vision_prefix in name:
+                        clean_name = name.replace(f"{config.vision_prefix}.", "")
+                        vision_weights[clean_name] = f.get_tensor(name)
+        
+        missing, unexpected = vision_encoder.load_state_dict(vision_weights, strict=False)
+        
+        if missing:
+            print(f"  Warning: Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"  Warning: Unexpected keys: {len(unexpected)}")
+        
+        vision_encoder = vision_encoder.to(device).half()
+        vision_encoder.eval()
+        
+        param_count = sum(p.numel() for p in vision_encoder.parameters()) / 1e6
+        print(f"  ✓ Vision encoder loaded: {param_count:.1f}M params")
+        
+        return vision_encoder
+        
+    except ImportError as e:
+        print(f"  Vision encoder import failed: {e}")
+        print("  Make sure transformers >= 4.57.0 is installed")
+        return None
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    print_banner()
+    global CONFIG, device
+    
+    # Load config from model
+    CONFIG = load_config_from_model(CONFIG)
+    device = torch.device(CONFIG.device)
+    
+    print_banner(CONFIG)
+    
+    # Check transformers version
+    check_transformers_version()
     
     # 1. Load calibration data
     print("\n[1/7] Loading calibration data...")
     dataset = CalibrationDataset(CONFIG.calibration_data_path)
     samples = dataset.generate_samples(CONFIG.max_samples)
     
-    # 2. Load tokenizer/processor
+    # 2. Load processor
     print("\n[2/7] Loading processor...")
-    try:
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(CONFIG.model_path, trust_remote_code=True)
-        use_hf_processor = True
-        print("  Using HuggingFace AutoProcessor")
-    except Exception as e:
-        print(f"  AutoProcessor failed: {e}")
-        print("  Using simple processor fallback")
-        use_hf_processor = False
-        processor = None
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(CONFIG.model_path, trust_remote_code=True)
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+    print("  ✓ Processor loaded")
     
     # 3. Load embeddings
     print("\n[3/7] Loading embeddings...")
@@ -817,235 +766,97 @@ def main():
                 embed_key = k
                 break
     
-    with safe_open(os.path.join(CONFIG.model_path, embed_shard), framework="pt", device="cuda:0") as f:
+    with safe_open(os.path.join(CONFIG.model_path, embed_shard), framework="pt", device=str(device)) as f:
         embed_weight = f.get_tensor(embed_key)
     
     embed_tokens = nn.Embedding(embed_weight.shape[0], embed_weight.shape[1], device=device)
     embed_tokens.weight.data = embed_weight.half()
-    
-    print(f"  Embedding: {embed_weight.shape}")
+    print(f"  ✓ Embeddings: {embed_weight.shape}")
     
     # 4. Load vision encoder
     print("\n[4/7] Loading vision encoder...")
-    
-    vision_weights = load_vision_weights(CONFIG.model_path)
-    print(f"  Loaded {len(vision_weights)} vision weight tensors")
-    
-    # Check if we can use transformers vision encoder
-    vision_encoder = None
-    simple_vision_processor = SimpleVisionProcessor(CONFIG)
-    
-    try:
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(CONFIG.model_path, trust_remote_code=True)
-        
-        # Try to get vision encoder from model
-        if hasattr(config, 'vision_config'):
-            print("  Vision config found, using simplified encoder")
-            # For now use simplified processor
-            # Full implementation would load Qwen3VLVisionEncoder from transformers
-    except Exception as e:
-        print(f"  Vision encoder setup: {e}")
+    vision_encoder = load_vision_encoder(CONFIG.model_path, CONFIG)
     
     # 5. Process samples
     print("\n[5/7] Processing calibration samples...")
     all_hidden = []
-    
-    # Get tokenizer
-    if use_hf_processor:
-        tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-    else:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_path, trust_remote_code=True)
-    
     vision_count = 0
     text_count = 0
     
-    # Try to load full model's vision encoder for proper processing
-    vision_model = None
-    try:
-        from transformers import AutoModel, AutoConfig
-        print("  Attempting to load vision encoder from transformers...")
-        
-        # Load just the visual part
-        full_config = AutoConfig.from_pretrained(CONFIG.model_path, trust_remote_code=True)
-        
-        # Check if we have Qwen3VL vision encoder available
-        try:
-            from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeVisionEncoder
-            vision_model = Qwen3VLMoeVisionEncoder(full_config.vision_config).to(device).half()
-            
-            # Load vision weights into the encoder
-            vision_state_dict = {}
-            for name, tensor in vision_weights.items():
-                # Remove prefix
-                clean_name = name.replace(f"{CONFIG.vision_prefix}.", "")
-                vision_state_dict[clean_name] = tensor
-            
-            vision_model.load_state_dict(vision_state_dict, strict=False)
-            vision_model.eval()
-            print(f"  ✓ Vision encoder loaded: {sum(p.numel() for p in vision_model.parameters())/1e6:.1f}M params")
-            
-        except ImportError:
-            # Try Qwen2VL encoder as fallback (similar architecture)
-            try:
-                from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLVisionBlock
-                print("  Using Qwen2VL-style vision blocks")
-            except ImportError:
-                print("  Vision encoder class not available in transformers")
-                vision_model = None
-                
-    except Exception as e:
-        print(f"  Vision encoder loading failed: {e}")
-        vision_model = None
-    
-    # If no vision model, we'll use a simpler approach:
-    # Process images through patch embedding and simple projection
-    if vision_model is None:
-        print("  Using simplified vision processing (patch embed + projection)")
-        
-        # Load patch embed and merger weights for simple processing
-        patch_embed_weight = vision_weights.get(f"{CONFIG.vision_prefix}.patch_embed.proj.weight")
-        merger_fc1_w = vision_weights.get(f"{CONFIG.vision_prefix}.merger.mlp.0.weight")
-        merger_fc1_b = vision_weights.get(f"{CONFIG.vision_prefix}.merger.mlp.0.bias")
-        merger_fc2_w = vision_weights.get(f"{CONFIG.vision_prefix}.merger.mlp.2.weight")
-        merger_fc2_b = vision_weights.get(f"{CONFIG.vision_prefix}.merger.mlp.2.bias")
-        
-        if patch_embed_weight is not None:
-            print(f"  ✓ Patch embed weight: {patch_embed_weight.shape}")
-        if merger_fc2_w is not None:
-            print(f"  ✓ Merger output weight: {merger_fc2_w.shape}")
-    
     for sample in tqdm(samples, desc="  Encoding"):
         try:
-            if sample.get('type') == 'vision':
-                # Load image
+            if sample.get('type') == 'vision' and vision_encoder is not None:
                 image = Image.open(sample['image_path']).convert('RGB')
                 
-                if use_hf_processor:
-                    # Use HF processor for proper tokenization
-                    messages = [{'role': 'user', 'content': [
-                        {'type': 'image', 'image': image},
-                        {'type': 'text', 'text': sample['prompt']}
-                    ]}]
+                messages = [{'role': 'user', 'content': [
+                    {'type': 'image', 'image': image},
+                    {'type': 'text', 'text': sample['prompt']}
+                ]}]
+                
+                try:
+                    text = processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    inputs = processor(
+                        text=[text], images=[image],
+                        return_tensors='pt', padding=True
+                    )
                     
-                    try:
-                        text = processor.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=True
-                        )
-                        inputs = processor(
-                            text=[text], images=[image],
-                            return_tensors='pt', padding=True
-                        )
+                    input_ids = inputs['input_ids'].to(device)
+                    pixel_values = inputs.get('pixel_values')
+                    image_grid_thw = inputs.get('image_grid_thw')
+                    
+                    with torch.no_grad():
+                        text_embeds = embed_tokens(input_ids)
+                    
+                    if pixel_values is not None:
+                        pixel_values = pixel_values.to(device).half()
                         
-                        input_ids = inputs['input_ids'].to(device)
-                        pixel_values = inputs.get('pixel_values')
-                        image_grid_thw = inputs.get('image_grid_thw')
-                        
-                        # Get text embeddings
                         with torch.no_grad():
-                            text_embeds = embed_tokens(input_ids)
-                        
-                        # Process vision if we have pixel values
-                        if pixel_values is not None:
-                            pixel_values = pixel_values.to(device).half()
-                            
-                            # Find image token positions
-                            image_mask = (input_ids[0] == CONFIG.image_token_id)
-                            image_positions = torch.where(image_mask)[0]
-                            
-                            if len(image_positions) > 0:
-                                # Get vision embeddings
-                                if vision_model is not None:
-                                    # Use full vision encoder
-                                    with torch.no_grad():
-                                        if image_grid_thw is not None:
-                                            image_grid_thw = image_grid_thw.to(device)
-                                            vision_embeds = vision_model(pixel_values, grid_thw=image_grid_thw)
-                                        else:
-                                            vision_embeds = vision_model(pixel_values)
-                                else:
-                                    # Simplified vision processing
-                                    # 1. Patch embedding
-                                    if pixel_values.dim() == 4:
-                                        pixel_values = pixel_values.unsqueeze(2)  # Add temporal dim
-                                    
-                                    if patch_embed_weight is not None:
-                                        # Conv3d patch embedding
-                                        patch_embed = F.conv3d(
-                                            pixel_values,
-                                            patch_embed_weight.to(device),
-                                            stride=(CONFIG.vision_temporal_patch_size, 
-                                                   CONFIG.vision_patch_size, 
-                                                   CONFIG.vision_patch_size)
-                                        )
-                                        # Flatten patches: [B, C, T, H, W] -> [B, num_patches, C]
-                                        vision_embeds = patch_embed.flatten(2).transpose(1, 2)
-                                        
-                                        # 2. Project to LLM hidden size via merger
-                                        if merger_fc2_w is not None:
-                                            # Simplified: just project last dim
-                                            # Full merger does spatial merge first
-                                            vision_embeds = F.linear(
-                                                F.gelu(F.linear(vision_embeds, merger_fc1_w.to(device), merger_fc1_b.to(device) if merger_fc1_b is not None else None)),
-                                                merger_fc2_w.to(device),
-                                                merger_fc2_b.to(device) if merger_fc2_b is not None else None
-                                            )
-                                    else:
-                                        # Last resort: random embeddings (not ideal but allows processing)
-                                        num_vision_tokens = len(image_positions)
-                                        vision_embeds = torch.randn(1, num_vision_tokens, CONFIG.hidden_size, 
-                                                                   device=device, dtype=torch.half) * 0.02
-                                
-                                # Replace image tokens with vision embeddings
-                                combined = text_embeds.clone()
-                                num_vision = min(len(image_positions), vision_embeds.shape[1])
-                                
-                                for i in range(num_vision):
-                                    if i < vision_embeds.shape[1]:
-                                        combined[0, image_positions[i]] = vision_embeds[0, i]
-                                
-                                hidden = combined.squeeze(0)
-                                vision_count += 1
+                            if image_grid_thw is not None:
+                                image_grid_thw = image_grid_thw.to(device)
+                                vision_embeds = vision_encoder(pixel_values, grid_thw=image_grid_thw)
                             else:
-                                # No image tokens found, use text only
-                                hidden = text_embeds.squeeze(0)
-                                text_count += 1
+                                vision_embeds = vision_encoder(pixel_values)
+                        
+                        image_mask = (input_ids[0] == CONFIG.image_token_id)
+                        image_positions = torch.where(image_mask)[0]
+                        
+                        if len(image_positions) > 0 and vision_embeds is not None:
+                            if hasattr(vision_embeds, 'last_hidden_state'):
+                                v_embeds = vision_embeds.last_hidden_state
+                            else:
+                                v_embeds = vision_embeds
+                            
+                            combined = text_embeds.clone()
+                            num_vision = min(len(image_positions), v_embeds.shape[1])
+                            
+                            for i in range(num_vision):
+                                combined[0, image_positions[i]] = v_embeds[0, i]
+                            
+                            hidden = combined.squeeze(0)
+                            vision_count += 1
                         else:
                             hidden = text_embeds.squeeze(0)
                             text_count += 1
-                            
-                    except Exception as e:
-                        # Fallback to text-only
-                        inputs = tokenizer(
-                            sample['prompt'],
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=CONFIG.max_seq_len
-                        ).to(device)
-                        
-                        with torch.no_grad():
-                            hidden = embed_tokens(inputs['input_ids']).squeeze(0)
+                    else:
+                        hidden = text_embeds.squeeze(0)
                         text_count += 1
-                else:
-                    # No HF processor - text only fallback
+                        
+                except Exception as e:
                     inputs = tokenizer(
-                        sample['prompt'],
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=CONFIG.max_seq_len
+                        sample['prompt'], return_tensors="pt",
+                        truncation=True, max_length=CONFIG.max_seq_len
                     ).to(device)
                     
                     with torch.no_grad():
                         hidden = embed_tokens(inputs['input_ids']).squeeze(0)
                     text_count += 1
             else:
-                # Text-only sample
+                prompt = sample.get('prompt', 'Hello')
                 inputs = tokenizer(
-                    sample.get('prompt', 'Hello'),
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=CONFIG.max_seq_len
+                    prompt, return_tensors="pt",
+                    truncation=True, max_length=CONFIG.max_seq_len
                 ).to(device)
                 
                 with torch.no_grad():
@@ -1058,19 +869,15 @@ def main():
             all_hidden.append(hidden)
             
         except Exception as e:
-            print(f"  Error processing sample: {e}")
+            print(f"  Error: {e}")
             continue
     
-    # Cleanup vision model
-    if vision_model is not None:
-        del vision_model
-        torch.cuda.empty_cache()
-    
     del embed_tokens
-    del vision_weights
+    if vision_encoder is not None:
+        del vision_encoder
     torch.cuda.empty_cache()
     
-    print(f"  Processed: {len(all_hidden)} samples ({vision_count} vision, {text_count} text)")
+    print(f"  ✓ Processed {len(all_hidden)} samples ({vision_count} vision, {text_count} text)")
     
     if len(all_hidden) == 0:
         print("ERROR: No samples processed!")
@@ -1084,11 +891,12 @@ def main():
         max_position=CONFIG.max_seq_len,
         rope_theta=CONFIG.rope_theta,
         mrope_section=CONFIG.mrope_section,
-        interleaved=CONFIG.mrope_interleaved
+        interleaved=CONFIG.mrope_interleaved,
+        device=device
     )
     
-    score_accumulator = ReapScoreAccumulator(CONFIG.num_experts, CONFIG.num_layers)
-    layer_processor = LayerProcessor(CONFIG.model_path)
+    score_accumulator = ReapScoreAccumulator(CONFIG.num_experts, CONFIG.num_layers, device)
+    layer_processor = LayerProcessor(CONFIG.model_path, CONFIG)
     
     def progress_cb(layer_idx, layer_time, active_experts):
         if layer_idx % 10 == 0 or layer_idx == CONFIG.num_layers - 1:
@@ -1102,7 +910,6 @@ def main():
     
     print(f"\n  Total time: {total_time/60:.1f} minutes")
     
-    # Results
     reap_scores = score_accumulator.get_scores()
     expert_counts = score_accumulator.get_counts()
     
@@ -1120,7 +927,7 @@ def main():
     os.makedirs(CONFIG.output_path, exist_ok=True)
     
     metadata = {
-        'reap_version': 'v12.2_qwen3vl_awq',
+        'reap_version': 'v12.4_qwen3vl_awq',
         'model': 'Qwen3-VL-235B-A22B-Thinking-AWQ',
         'formula': 'Sⱼ = (1/|𝒳ⱼ|) × Σ(x∈𝒳ⱼ) gⱼ(x) · ‖fⱼ(x)‖₂',
         'prune_ratio': CONFIG.prune_ratio,
@@ -1131,6 +938,7 @@ def main():
         'rope_theta': CONFIG.rope_theta,
         'mrope_interleaved': CONFIG.mrope_interleaved,
         'mrope_section': CONFIG.mrope_section,
+        'norm_topk_prob': CONFIG.norm_topk_prob,
         'calibration_samples': len(all_hidden),
         'vision_samples': vision_count,
         'text_samples': text_count,
@@ -1143,7 +951,8 @@ def main():
     with open(os.path.join(CONFIG.output_path, 'reap_metadata.json'), 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    for fname in ['config.json', 'tokenizer.json', 'tokenizer_config.json']:
+    for fname in ['config.json', 'tokenizer.json', 'tokenizer_config.json', 
+                  'chat_template.json', 'preprocessor_config.json']:
         src = os.path.join(CONFIG.model_path, fname)
         if os.path.exists(src):
             shutil.copy2(src, CONFIG.output_path)
@@ -1161,6 +970,7 @@ def main():
     print(f"  COMPLETE!")
     print(f"  Output: {CONFIG.output_path}")
     print(f"  Experts: {CONFIG.num_experts} -> {experts_to_keep_count}")
+    print(f"\n  Next: python prune_model_v12.4.py --metadata {CONFIG.output_path}/reap_metadata.json")
     print(f"{'='*70}\n")
 
 
